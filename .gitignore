@@ -3,6 +3,4 @@ node_modules/
 .env
 .env.local
 .DS_Store
-functions/node_modules/
-functions/.runtimeconfig.json
 *.log
