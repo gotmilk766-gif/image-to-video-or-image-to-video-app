@@ -1,157 +1,126 @@
-const functions = require("firebase-functions");
+const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
-const fetch = require("node-fetch");
 
 admin.initializeApp();
-const db = admin.firestore();
 const storage = admin.storage();
 
-const REPLICATE_TOKEN = functions.config().replicate?.token;
-if (!REPLICATE_TOKEN) {
-  console.warn("No replicate token set in functions config. Set with: firebase functions:config:set replicate.token=\"TOKEN\"");
-}
+const REPLICATE_TOKEN = defineSecret("REPLICATE_TOKEN");
 
-// Replace with the model version id you choose on Replicate marketplace
-let MODEL_VERSION = "REPLICATE_MODEL_VERSION"; // e.g. "owner/model@version"
+// Fast, cheap, well-supported image-to-video model on Replicate.
+// Check https://replicate.com/wan-video/wan-2.2-i2v-fast for the current
+// input schema if this ever stops working -- providers change input fields
+// occasionally, more often than the model name itself.
+const MODEL = "wan-video/wan-2.2-i2v-fast";
 
-// Helper to add CORS headers for browser calls
 function setCors(res) {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
 }
 
-exports.createRenderJob = functions.https.onRequest(async (req, res) => {
-  // Basic CORS handling
-  setCors(res);
-  if (req.method === 'OPTIONS') {
-    return res.status(204).send('');
-  }
+exports.createRenderJob = onRequest(
+  { secrets: [REPLICATE_TOKEN], timeoutSeconds: 300, memory: "1GiB" },
+  async (req, res) => {
+    setCors(res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
 
-  try {
-    const { imageUrls, prompt, duration = 8, fps = 24, modelVersion } = req.body || {};
-    if (!imageUrls || !prompt) return res.status(400).json({ error: "missing imageUrls or prompt" });
-
-    // Optionally allow caller to override model version per-request
-    if (modelVersion && typeof modelVersion === 'string') {
-      MODEL_VERSION = modelVersion;
-    }
-
-    const jobRef = await db.collection("renderJobs").add({
-      imageUrls,
-      prompt,
-      duration,
-      fps,
-      status: "queued",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // Start Replicate prediction
-    const startResp = await fetch("https://api.replicate.com/v1/predictions", {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${REPLICATE_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        version: MODEL_VERSION,
-        input: {
-          images: imageUrls,
-          prompt,
-          duration,
-          fps
-        }
-      })
-    });
-
-    if (!startResp.ok) {
-      const errText = await startResp.text();
-      console.error('Replicate start error:', startResp.status, errText);
-      await jobRef.update({ status: 'failed', error: `replicate start failed: ${startResp.status}` });
-      return res.status(500).json({ error: 'replicate start failed', details: errText });
-    }
-
-    const startJson = await startResp.json();
-    const predictionId = startJson.id;
-    await jobRef.update({ status: "running", replicateId: predictionId, startedAt: admin.firestore.FieldValue.serverTimestamp() });
-
-    // Polling loop (simple). Consider using webhooks if model/provider supports.
-    let prediction = startJson;
-    const maxChecks = 120; // avoid infinite loops; ~6 minutes with 3s interval
-    let checks = 0;
-    while (prediction.status !== "succeeded" && prediction.status !== "failed" && checks < maxChecks) {
-      await new Promise((r) => setTimeout(r, 3000));
-      checks += 1;
-      const statusResp = await fetch(`https://api.replicate.com/v1/predictions/${predictionId}`, {
-        headers: { Authorization: `Token ${REPLICATE_TOKEN}` }
-      });
-      if (!statusResp.ok) {
-        const errText = await statusResp.text();
-        console.error('Replicate status error:', statusResp.status, errText);
-        break;
+    try {
+      const { imageUrl, prompt = "", aspect = "9:16" } = req.body || {};
+      if (!imageUrl) {
+        return res.status(400).json({ error: "imageUrl is required" });
       }
-      prediction = await statusResp.json();
+
+      const token = REPLICATE_TOKEN.value();
+
+      // Start the prediction. "Prefer: wait" makes Replicate hold the
+      // connection open and return once it's done (up to ~60s), which
+      // avoids a separate polling round-trip for short jobs.
+      const startResp = await fetch(
+        `https://api.replicate.com/v1/models/${MODEL}/predictions`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            Prefer: "wait=60",
+          },
+          body: JSON.stringify({
+            input: {
+              image: imageUrl,
+              prompt,
+              aspect_ratio: aspect,
+            },
+          }),
+        }
+      );
+
+      if (!startResp.ok) {
+        const errText = await startResp.text();
+        console.error("Replicate start error:", startResp.status, errText);
+        return res
+          .status(502)
+          .json({ error: "Failed to start generation", details: errText });
+      }
+
+      let prediction = await startResp.json();
+
+      // If it wasn't done within the wait window, poll for completion.
+      const maxChecks = 60; // ~3 minutes at 3s intervals
+      let checks = 0;
+      while (
+        prediction.status !== "succeeded" &&
+        prediction.status !== "failed" &&
+        prediction.status !== "canceled" &&
+        checks < maxChecks
+      ) {
+        await new Promise((r) => setTimeout(r, 3000));
+        checks += 1;
+        const statusResp = await fetch(
+          `https://api.replicate.com/v1/predictions/${prediction.id}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!statusResp.ok) break;
+        prediction = await statusResp.json();
+      }
+
+      if (prediction.status !== "succeeded") {
+        console.error("Prediction did not succeed:", prediction);
+        return res.status(500).json({
+          error: `Generation ${prediction.status || "timed out"}`,
+          details: prediction.error || null,
+        });
+      }
+
+      const outputUrl = Array.isArray(prediction.output)
+        ? prediction.output[0]
+        : prediction.output;
+
+      if (!outputUrl) {
+        return res.status(500).json({ error: "No output from model" });
+      }
+
+      // Download the generated video and re-host it in Firebase Storage
+      // so you own a permanent copy (Replicate output URLs expire).
+      const videoResp = await fetch(outputUrl);
+      if (!videoResp.ok) {
+        return res.status(500).json({ error: "Failed to download generated video" });
+      }
+      const buffer = Buffer.from(await videoResp.arrayBuffer());
+
+      const fileName = `videos/${Date.now()}-${prediction.id}.mp4`;
+      const file = storage.bucket().file(fileName);
+      await file.save(buffer, { contentType: "video/mp4" });
+
+      const [signedUrl] = await file.getSignedUrl({
+        action: "read",
+        expires: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
+      });
+
+      return res.status(200).json({ mp4Url: signedUrl });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ error: err.message });
     }
-
-    if (prediction.status === "failed") {
-      await jobRef.update({ status: "failed", error: prediction });
-      return res.status(500).json({ jobId: jobRef.id, status: "failed", error: prediction });
-    }
-
-    if (checks >= maxChecks && prediction.status !== 'succeeded') {
-      await jobRef.update({ status: 'failed', error: 'prediction timeout' });
-      return res.status(500).json({ jobId: jobRef.id, status: 'failed', error: 'prediction timeout' });
-    }
-
-    // model output handling varies; many models return prediction.output as array of urls or a single url or structured object
-    let outputUrl = null;
-    if (!prediction.output) {
-      // Some models provide output in prediction.result or other keys; log the whole object for debugging
-      console.warn('No prediction.output; full prediction obj:', JSON.stringify(prediction).slice(0, 2000));
-    }
-    if (Array.isArray(prediction.output)) {
-      outputUrl = prediction.output[0];
-    } else if (typeof prediction.output === 'string') {
-      outputUrl = prediction.output;
-    } else if (prediction.output && prediction.output[0] && typeof prediction.output[0] === 'string') {
-      outputUrl = prediction.output[0];
-    } else if (prediction.output && prediction.output.video) {
-      outputUrl = prediction.output.video;
-    }
-
-    if (!outputUrl) {
-      await jobRef.update({ status: "failed", error: "no output url", prediction });
-      return res.status(500).json({ jobId: jobRef.id, status: "failed", error: "no output url", prediction });
-    }
-
-    // Download file and upload to Firebase Storage
-    const outResp = await fetch(outputUrl);
-    if (!outResp.ok) {
-      const errText = await outResp.text();
-      console.error('Failed to download output:', outResp.status, errText);
-      await jobRef.update({ status: 'failed', error: `download failed: ${outResp.status}` });
-      return res.status(500).json({ error: 'download failed', details: errText });
-    }
-    const buffer = await outResp.arrayBuffer();
-    const fileName = `videos/${jobRef.id}.mp4`;
-    const file = storage.bucket().file(fileName);
-    await file.save(Buffer.from(buffer), { contentType: "video/mp4" });
-
-    // Generate signed URL (long expiration)
-    const [signedUrl] = await file.getSignedUrl({
-      action: 'read',
-      expires: '03-09-2491'
-    });
-
-    await jobRef.update({
-      status: "succeeded",
-      mp4Url: signedUrl,
-      finishedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    return res.json({ jobId: jobRef.id, mp4Url: signedUrl });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
   }
-});
+);

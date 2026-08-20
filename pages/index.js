@@ -1,78 +1,119 @@
 import { useState } from "react";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { collection, doc, setDoc, serverTimestamp } from "firebase/firestore";
-import { storage, db } from "../lib/firebaseClient";
+import { storage } from "../lib/firebaseClient";
+
+const ASPECTS = [
+  { label: "Vertical (TikTok / Reels) 9:16", value: "9:16" },
+  { label: "Square 1:1", value: "1:1" },
+  { label: "Landscape 16:9", value: "16:9" },
+];
 
 export default function Home() {
-  const [files, setFiles] = useState([]);
+  const [file, setFile] = useState(null);
   const [prompt, setPrompt] = useState("");
+  const [aspect, setAspect] = useState("9:16");
   const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
   const RENDER_FN = process.env.NEXT_PUBLIC_RENDER_FUNCTION_URL;
 
-  const handleFiles = (e) => setFiles(Array.from(e.target.files || []));
+  const handleFile = (e) => setFile(e.target.files?.[0] || null);
 
-  const uploadAndCreateJob = async () => {
-    if (!files.length || !prompt) return alert("Select images and enter a prompt");
+  const submit = async () => {
+    setError(null);
+    setResult(null);
+
+    if (!file) return setError("Choose an image first.");
+    if (!RENDER_FN) {
+      return setError(
+        "NEXT_PUBLIC_RENDER_FUNCTION_URL is not set. Add it to .env.local after deploying the function."
+      );
+    }
+
     setLoading(true);
     try {
-      const uploadedUrls = [];
-      for (const file of files) {
-        const path = `uploads/${Date.now()}-${file.name}`;
-        const storageRef = ref(storage, path);
-        await uploadBytes(storageRef, file);
-        const url = await getDownloadURL(storageRef);
-        uploadedUrls.push(url);
-      }
+      // 1. Upload the image to Firebase Storage
+      const path = `uploads/${Date.now()}-${file.name}`;
+      const storageRef = ref(storage, path);
+      await uploadBytes(storageRef, file);
+      const imageUrl = await getDownloadURL(storageRef);
 
-      // call render function
+      // 2. Call the Cloud Function to start generation
       const resp = await fetch(RENDER_FN, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageUrls: uploadedUrls,
-          prompt,
-          duration: 8,
-          fps: 24
-        })
+        body: JSON.stringify({ imageUrl, prompt, aspect }),
       });
+
       const data = await resp.json();
-      // create a local record in Firestore to show job quickly (optional)
-      const jobRef = doc(collection(db, "renderJobs"));
-      await setDoc(jobRef, {
-        prompt,
-        imageUrls: uploadedUrls,
-        createdAt: serverTimestamp(),
-        replicateId: data.replicateId || null,
-        status: data.status || "queued"
-      });
-      alert("Job created: " + (data.jobId || "check jobs list"));
+      if (!resp.ok) {
+        throw new Error(data.error || `Request failed (${resp.status})`);
+      }
+
+      setResult(data); // { mp4Url }
     } catch (err) {
       console.error(err);
-      alert("Error: " + err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <main style={{ padding: 24 }}>
-      <h1>Image → Video (vertical)</h1>
-      <p>Upload images, enter a prompt, and create a render job.</p>
+    <main style={{ maxWidth: 560, margin: "40px auto", padding: 16, fontFamily: "system-ui, sans-serif" }}>
+      <h1>Image → Video</h1>
+      <p style={{ color: "#666" }}>
+        Upload an image, describe the motion you want, and generate a short vertical
+        video for TikTok / Reels / Fanvue.
+      </p>
 
-      <input type="file" multiple accept="image/*" onChange={handleFiles} />
+      <div style={{ marginTop: 20 }}>
+        <input type="file" accept="image/*" onChange={handleFile} />
+      </div>
+
       <div style={{ marginTop: 12 }}>
-        <input
-          placeholder="Enter prompt..."
+        <textarea
+          placeholder="Describe the motion, e.g. 'slow zoom in, hair blowing in the wind'"
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          style={{ width: "60%" }}
+          rows={3}
+          style={{ width: "100%", padding: 8 }}
         />
       </div>
+
       <div style={{ marginTop: 12 }}>
-        <button onClick={uploadAndCreateJob} disabled={loading}>
-          {loading ? "Creating..." : "Create Render Job"}
+        <select value={aspect} onChange={(e) => setAspect(e.target.value)} style={{ padding: 8 }}>
+          {ASPECTS.map((a) => (
+            <option key={a.value} value={a.value}>
+              {a.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <button onClick={submit} disabled={loading} style={{ padding: "10px 20px" }}>
+          {loading ? "Generating… (can take 1–3 min)" : "Generate video"}
         </button>
       </div>
+
+      {error && (
+        <p style={{ color: "crimson", marginTop: 16 }}>
+          {error}
+        </p>
+      )}
+
+      {result?.mp4Url && (
+        <div style={{ marginTop: 24 }}>
+          <video src={result.mp4Url} controls style={{ width: "100%", maxWidth: 320 }} />
+          <p>
+            <a href={result.mp4Url} download>
+              Download MP4
+            </a>
+          </p>
+        </div>
+      )}
     </main>
   );
 }
